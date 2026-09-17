@@ -18,6 +18,7 @@ from backend.llm.client import LLMClient
 from backend.monitoring.budget import BudgetConfig, BudgetManager
 from backend.monitoring.logger import AgentLogger
 from backend.planning.planner import Planner
+from backend.planning.replanner import Replanner
 from backend.reasoning.verifier import Verifier
 from backend.tools.calculator import CalculatorTool
 from backend.tools.registry import ToolRegistry
@@ -48,7 +49,7 @@ class Agent:
         # Logger is created first and injected everywhere
         self.logger = AgentLogger(verbose=verbose)
 
-        # LLM client — only Gemini SDK usage in the entire project
+        # LLM client — Groq SDK used ONLY as thin LLM interface
         self.llm = LLMClient(model=cfg.get("model"))
         self.logger.info(f"LLM: {self.llm._model_name}")
 
@@ -80,6 +81,11 @@ class Agent:
             use_llm_verification=cfg.get("use_llm_verification", False),
         )
         self.planner = Planner(llm=self.llm, logger=self.logger)
+
+        # Phase 2: Replanner — enabled by default, disable via config use_replanner=False
+        _use_replanner = cfg.get("use_replanner", True)
+        self.replanner = Replanner(llm=self.llm, logger=self.logger) if _use_replanner else None
+
         self.loop = LoopController(
             llm=self.llm,
             tool_registry=self.registry,
@@ -88,6 +94,7 @@ class Agent:
             context_manager=self.context_manager,
             budget_manager=self.budget,
             logger=self.logger,
+            replanner=self.replanner,
         )
 
     def run(self, task: str) -> dict:

@@ -1,27 +1,28 @@
 """
 Loop Controller — the custom agent runtime core.
 
-Implements the PLAN → ACT → OBSERVE → VERIFY → RECOVER loop.
+Implements the PLAN → ACT → OBSERVE → VERIFY → RECOVER/REPLAN loop.
+
+Phase 2 additions:
+  - DAGManager: validates dependency graph, computes topo order, marks BLOCKED goals
+  - Replanner: on goal failure, proposes recovery goals to inject into the DAG
+  - Deadlock detection: if no ready goals exist and none are running, fail all stranded goals
 
 This is the most important file in the framework. Every step of the agent loop
 is explicit Python code — no external framework, no hidden abstractions.
 
 Loop cycle:
-  1. Pick the highest-priority ready goal.
+  1. DAGManager: compute ready goals (PENDING + all deps COMPLETED).
   2. Build minimal context (ContextManager).
   3. Ask LLM to select an action: tool_call or direct_answer.
   4. Execute the action (ToolExecutor).
   5. Record the Observation in state.
   6. Verify: does the observation satisfy the goal? (Verifier)
-  7a. VALID → mark goal COMPLETED, continue to next goal.
+  7a. VALID → mark goal COMPLETED, update DAG (may unblock dependents), continue.
   7b. INCOMPLETE/INVALID → recovery: retry with same or different approach.
-  7c. Exhausted attempts → mark goal FAILED.
+  7c. Exhausted attempts → mark goal FAILED → Replanner: inject recovery goals OR
+      DAGManager.update_blocked() marks all dependents BLOCKED.
   8. Check termination: all goals terminal, or budget exhausted.
-
-Recovery (Phase 1):
-  - Retry up to MAX_GOAL_ATTEMPTS times per goal.
-  - The LLM sees previous failed observations in context → naturally adapts.
-  - Phase 3 will add explicit tool-switching and replanning logic.
 """
 from __future__ import annotations
 
@@ -41,6 +42,8 @@ from backend.execution.executor import ToolExecutor
 from backend.llm.client import LLMClient, LLMError
 from backend.monitoring.budget import BudgetExhaustedError, BudgetManager
 from backend.monitoring.logger import AgentLogger
+from backend.planning.dag_manager import DAGManager, DAGValidationError
+from backend.planning.replanner import Replanner
 from backend.reasoning.verifier import Verifier
 from backend.tools.registry import ToolRegistry
 
@@ -90,7 +93,7 @@ accurate, and concise final answer for the user.
 Rules:
   - Integrate all relevant results naturally.
   - Be specific: include numbers, names, and facts from the results.
-  - If some goals failed, acknowledge what could not be determined.
+  - If some goals failed or were blocked, acknowledge what could not be determined.
   - Do NOT fabricate information not present in the goal results.
   - Use plain, readable prose. Format numbers clearly.
 """
@@ -98,13 +101,14 @@ Rules:
 
 class LoopController:
     """
-    The custom agent runtime — PLAN→ACT→OBSERVE→VERIFY loop.
+    The custom agent runtime — PLAN→ACT→OBSERVE→VERIFY→RECOVER loop.
 
-    All agent orchestration logic lives here as explicit Python.
-    No external framework, no hidden magic.
+    Phase 2: integrates DAGManager (dependency tracking) and Replanner
+    (dynamic goal injection on failure). All orchestration is explicit Python.
     """
 
     MAX_GOAL_ATTEMPTS = 3  # Retries per goal before marking FAILED
+    MAX_REPLAN_ROUNDS = 2  # Max times the replanner may inject new goals
 
     def __init__(
         self,
@@ -115,6 +119,7 @@ class LoopController:
         context_manager: ContextManager,
         budget_manager: BudgetManager,
         logger: AgentLogger,
+        replanner: Replanner | None = None,
     ) -> None:
         self._llm = llm
         self._registry = tool_registry
@@ -123,6 +128,7 @@ class LoopController:
         self._ctx = context_manager
         self._budget = budget_manager
         self._logger = logger
+        self._replanner = replanner  # None = replanning disabled
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -130,37 +136,84 @@ class LoopController:
         """
         Execute the agent loop until termination.
 
+        Phase 2: DAGManager validates the graph at entry, tracks BLOCKED goals
+        after each failure, and detects deadlocks.
+
         Termination conditions:
-          - All goals are in terminal status (COMPLETED / FAILED / SKIPPED)
+          - All goals are in terminal status (COMPLETED / FAILED / SKIPPED / BLOCKED)
           - BudgetExhaustedError is raised by BudgetManager
           - Unexpected exception (caught, logged, status set to FAILED)
         """
         state.status = AgentStatus.RUNNING
+        replan_rounds = 0
+
+        # ── Phase 2: Build and validate DAG ──────────────────────────────────
+        dag = DAGManager(state.goals, self._logger)
+        try:
+            dag.validate()
+            topo = dag.topo_order()
+            self._logger.info(
+                f"DAG validated. Topological order: {' → '.join(topo)}"
+            )
+        except DAGValidationError as exc:
+            self._logger.error(f"DAG validation failed: {exc}")
+            state.status = AgentStatus.FAILED
+            return state
 
         try:
             while not self._should_stop(state):
                 state.iterations += 1
                 self._budget.tick_iteration()
 
+                # ── Update BLOCKED goals after any failure ────────────────
+                dag.update_blocked(state)
+
                 # ── Pick next ready goal ──────────────────────────────────
-                ready = state.ready_goals()
+                ready = dag.ready_goals(state)
 
                 if not ready:
-                    if state.pending_goals():
-                        # Pending goals exist but none are ready — dependency deadlock
+                    if dag.is_deadlocked(state):
                         self._logger.warn(
-                            "No ready goals despite pending goals — possible dependency cycle."
+                            "DAG deadlock detected — no ready goals and no running goals."
                         )
-                        self._fail_blocked_goals(state)
+                        self._fail_stranded_goals(state)
                     break  # Nothing left to do
 
                 # Process highest-priority ready goal
-                goal = min(ready, key=lambda g: g.priority)
+                goal = ready[0]  # already sorted by (priority, id)
                 goal.status = GoalStatus.RUNNING
                 self._logger.goal_start(goal.id, goal.description)
 
                 # ── ACT → OBSERVE → VERIFY cycle ─────────────────────────
                 self._process_goal(goal, state)
+
+                # ── Phase 2: Replanning on failure ────────────────────────
+                if (
+                    goal.status == GoalStatus.FAILED
+                    and self._replanner is not None
+                    and replan_rounds < self.MAX_REPLAN_ROUNDS
+                ):
+                    new_goals = self._replanner.replan(goal, state)
+                    if new_goals:
+                        state.goals.extend(new_goals)
+                        # Rebuild DAG with the new goals
+                        dag = DAGManager(state.goals, self._logger)
+                        try:
+                            dag.validate()
+                        except DAGValidationError as exc:
+                            self._logger.warn(
+                                f"Replanned goals produced invalid DAG: {exc}. "
+                                "Discarding injected goals."
+                            )
+                            # Roll back injected goals
+                            for ng in new_goals:
+                                state.goals.remove(ng)
+                            dag = DAGManager(state.goals, self._logger)
+                        else:
+                            replan_rounds += 1
+                            self._logger.info(
+                                f"Replanning round {replan_rounds}/{self.MAX_REPLAN_ROUNDS} complete."
+                            )
 
         except BudgetExhaustedError as exc:
             self._logger.error(f"Budget exhausted: {exc.reason}")
@@ -241,7 +294,6 @@ class LoopController:
                     self._logger.goal_completed(goal.id)
                     return
                 else:
-                    # LLM returned empty direct_answer — treat as failure
                     self._logger.warn(f"direct_answer was empty for goal {goal.id}, retrying.")
                     self._budget.tick_retry()
                     continue
@@ -264,7 +316,6 @@ class LoopController:
                 return
 
             elif verification.status == VerificationStatus.INCOMPLETE:
-                # 🔄 Partial — retry (LLM will see previous obs in context)
                 self._logger.recovery_triggered(
                     f"Incomplete result for [{goal.id}] — retrying (attempt {goal.attempts}/{self.MAX_GOAL_ATTEMPTS})"
                 )
@@ -273,7 +324,7 @@ class LoopController:
                     continue
 
             else:
-                # INVALID / CONTRADICTORY / UNRELIABLE — retry with context
+                # INVALID / CONTRADICTORY / UNRELIABLE
                 self._logger.recovery_triggered(
                     f"Verification={verification.status.value} for [{goal.id}] "
                     f"— attempt {goal.attempts}/{self.MAX_GOAL_ATTEMPTS}"
@@ -308,7 +359,6 @@ class LoopController:
         try:
             self._budget.tick_llm_call()
             action = self._llm.complete_json(_ACTION_SELECTION_SYSTEM, user_prompt)
-            # Validate minimal structure
             if "action" not in action:
                 self._logger.warn("LLM action missing 'action' key. Retrying selection.")
                 return None
@@ -353,12 +403,12 @@ class LoopController:
             return True
         return False
 
-    def _fail_blocked_goals(self, state: AgentState) -> None:
-        """Mark all remaining pending goals as FAILED due to dependency deadlock."""
+    def _fail_stranded_goals(self, state: AgentState) -> None:
+        """Mark all remaining PENDING goals as FAILED due to DAG deadlock."""
         for goal in state.goals:
             if goal.status == GoalStatus.PENDING:
                 goal.status = GoalStatus.FAILED
-                goal.error = "Blocked: dependency goals never completed."
+                goal.error = "Stranded: dependency deadlock — no goal can execute."
                 self._logger.goal_failed(goal.id, goal.error)
 
     @staticmethod
@@ -370,4 +420,6 @@ class LoopController:
                 parts.append(f"[{goal.id}] {goal.description}:\n{goal.result}")
             elif goal.status == GoalStatus.FAILED:
                 parts.append(f"[{goal.id}] Could not complete: {goal.description}")
+            elif goal.status == GoalStatus.BLOCKED:
+                parts.append(f"[{goal.id}] Blocked (dependency failed): {goal.description}")
         return "\n\n".join(parts) if parts else "No results available."

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Adaptive Agent Runtime — CLI entry point (Phase 1)
+Adaptive Agent Runtime — CLI entry point (Phase 1 + Phase 2)
 
 Usage:
     python -m backend.main "Your task here"
     python -m backend.main               # interactive prompt
-    python -m backend.main --test        # run built-in test suite
+    python -m backend.main --test        # Phase 1 test suite
+    python -m backend.main --test-p2     # Phase 2 DAG + dependency tests
+    python -m backend.main --test-all    # both Phase 1 and Phase 2
 """
 from __future__ import annotations
 
@@ -24,8 +26,8 @@ load_dotenv()
 from backend.core.agent import Agent
 
 
-# ── Built-in test tasks ────────────────────────────────────────────────────────
-_TEST_TASKS = [
+# ── Phase 1 test tasks ─────────────────────────────────────────────────────────
+_P1_TASKS = [
     "What is 25 * 47 + 100?",
     "Search for information about AI agent frameworks",
     (
@@ -35,19 +37,48 @@ _TEST_TASKS = [
     ),
 ]
 
+# ── Phase 2 test tasks ─────────────────────────────────────────────────────────
+_P2_TASKS = [
+    # Test 1: Multi-step sequential DAG with explicit dependencies
+    # Planner should create: g1 (calculate) → g2 (search) → g3 (compare, depends g1+g2)
+    (
+        "First calculate what 15% of $8,500 is (use calculator). "
+        "Then search for the current US federal income tax rate for that income bracket. "
+        "Finally, tell me how the calculated amount compares to what the actual tax would be."
+    ),
 
-def _run_task(task: str, verbose: bool = True) -> dict:
+    # Test 2: Parallel DAG — two independent goals, then one synthesis goal
+    # Planner should identify g1 and g2 as independent (parallel), g3 depends on both
+    (
+        "Simultaneously look up: (a) the formula for the area of a circle, "
+        "and (b) search for the diameter of Earth in kilometers. "
+        "Then calculate the area if Earth's surface were a flat circle with that diameter."
+    ),
+
+    # Test 3: 4-node deep chain to verify dependency-aware execution order
+    # g1 → g2 → g3 → g4 must execute strictly in order
+    (
+        "Step 1: Calculate 2^10. "
+        "Step 2: Using the result of step 1, calculate that result divided by 4. "
+        "Step 3: Search for what the number from step 2 represents in computing (e.g. KB, MB). "
+        "Step 4: Summarize all three results together."
+    ),
+]
+
+
+def _run_task(task: str, verbose: bool = True, extra_cfg: dict | None = None) -> dict:
     """Run a single task and return the result dict."""
-    agent = Agent(
-        config={
-            "max_iterations": 15,
-            "max_tool_calls": 20,
-            "max_llm_calls": 30,
-            "max_retries": 9,
-            "use_llm_verification": False,
-        },
-        verbose=verbose,
-    )
+    cfg = {
+        "max_iterations": 15,
+        "max_tool_calls": 20,
+        "max_llm_calls": 30,
+        "max_retries": 9,
+        "use_llm_verification": False,
+        "use_replanner": True,
+    }
+    if extra_cfg:
+        cfg.update(extra_cfg)
+    agent = Agent(config=cfg, verbose=verbose)
     return agent.run(task)
 
 
@@ -80,39 +111,57 @@ def _print_goal_summary(result: dict) -> None:
     print()
 
 
-def _run_tests() -> None:
-    """Run the built-in test suite sequentially."""
+def _run_suite(tasks: list[str], suite_name: str) -> None:
+    """Run a list of test tasks sequentially."""
     print("\n" + "═" * 64)
-    print("  ADAPTIVE AGENT RUNTIME — Phase 1 Test Suite")
+    print(f"  ADAPTIVE AGENT RUNTIME — {suite_name}")
     print("═" * 64)
 
-    for i, task in enumerate(_TEST_TASKS, 1):
+    passed = 0
+    failed = 0
+    for i, task in enumerate(tasks, 1):
         print(f"\n\n{'━' * 64}")
-        print(f"  TEST {i}/{len(_TEST_TASKS)}")
+        print(f"  TEST {i}/{len(tasks)}")
         print(f"{'━' * 64}")
         try:
             result = _run_task(task)
             _print_goal_summary(result)
+            if result.get("status") == "COMPLETED":
+                passed += 1
+            else:
+                failed += 1
         except KeyboardInterrupt:
             print("\nTest run interrupted.")
             sys.exit(0)
         except Exception as exc:
             print(f"\n💥 Test {i} raised: {type(exc).__name__}: {exc}")
+            failed += 1
 
-    print("\n✅  All tests complete.")
+    print(f"\n{'═' * 64}")
+    print(f"  {suite_name} complete: {passed} passed, {failed} failed")
+    print("═" * 64)
 
 
 def main() -> None:
     args = sys.argv[1:]
 
+    if "--test-all" in args:
+        _run_suite(_P1_TASKS, "Phase 1 Test Suite")
+        _run_suite(_P2_TASKS, "Phase 2 Test Suite (DAG + Dependencies)")
+        return
+
+    if "--test-p2" in args:
+        _run_suite(_P2_TASKS, "Phase 2 Test Suite (DAG + Dependencies)")
+        return
+
     if "--test" in args:
-        _run_tests()
+        _run_suite(_P1_TASKS, "Phase 1 Test Suite")
         return
 
     if args:
         task = " ".join(args)
     else:
-        print("\nAdaptive Agent Runtime  —  Phase 1")
+        print("\nAdaptive Agent Runtime  —  Phase 2")
         print("Type your task and press Enter. Ctrl+C to exit.\n")
         try:
             task = input("Task: ").strip()
