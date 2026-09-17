@@ -19,6 +19,7 @@ from backend.monitoring.budget import BudgetConfig, BudgetManager
 from backend.monitoring.logger import AgentLogger
 from backend.planning.planner import Planner
 from backend.planning.replanner import Replanner
+from backend.reasoning.recovery_manager import RecoveryManager
 from backend.reasoning.verifier import Verifier
 from backend.tools.calculator import CalculatorTool
 from backend.tools.registry import ToolRegistry
@@ -82,9 +83,16 @@ class Agent:
         )
         self.planner = Planner(llm=self.llm, logger=self.logger)
 
-        # Phase 2: Replanner — enabled by default, disable via config use_replanner=False
+        # Phase 2: Replanner — enabled by default
         _use_replanner = cfg.get("use_replanner", True)
         self.replanner = Replanner(llm=self.llm, logger=self.logger) if _use_replanner else None
+
+        # Phase 3: RecoveryManager — enabled by default
+        _use_recovery = cfg.get("use_recovery", True)
+        self.recovery_manager = (
+            RecoveryManager(llm=self.llm, registry=self.registry, logger=self.logger)
+            if _use_recovery else None
+        )
 
         self.loop = LoopController(
             llm=self.llm,
@@ -95,6 +103,7 @@ class Agent:
             budget_manager=self.budget,
             logger=self.logger,
             replanner=self.replanner,
+            recovery_manager=self.recovery_manager,
         )
 
     def run(self, task: str) -> dict:

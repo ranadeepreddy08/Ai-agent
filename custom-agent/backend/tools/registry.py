@@ -47,6 +47,11 @@ class ToolRegistry:
             )
         self._tools[tool.name] = tool
 
+    def register_if_absent(self, tool: BaseTool) -> None:
+        """Register a tool only if not already registered (useful in tests)."""
+        if tool.name not in self._tools:
+            self._tools[tool.name] = tool
+
     # ── Queries ───────────────────────────────────────────────────────────────
 
     def get(self, name: str) -> BaseTool:

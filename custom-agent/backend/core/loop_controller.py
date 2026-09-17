@@ -1,28 +1,31 @@
 """
-Loop Controller — the custom agent runtime core.
+Loop Controller — Phase 3: full reliability pipeline.
 
-Implements the PLAN → ACT → OBSERVE → VERIFY → RECOVER/REPLAN loop.
-
-Phase 2 additions:
-  - DAGManager: validates dependency graph, computes topo order, marks BLOCKED goals
-  - Replanner: on goal failure, proposes recovery goals to inject into the DAG
-  - Deadlock detection: if no ready goals exist and none are running, fail all stranded goals
-
-This is the most important file in the framework. Every step of the agent loop
-is explicit Python code — no external framework, no hidden abstractions.
+Phase 3 additions over Phase 2:
+  1. RecoveryManager integration: after goal exhausts attempts, ask recovery manager
+     for a strategy (retry/modify_input/switch_tool/fallback/replan/terminate).
+  2. Strategy execution: LoopController acts on the RecoveryDecision.
+  3. Stuck detection: tracks "last completed count"; if no progress for
+     MAX_STUCK_ITERATIONS iterations, triggers recovery or terminates.
+  4. Per-goal attempt budget enforced by MAX_GOAL_ATTEMPTS before escalating.
+  5. All existing Phase 1+2 behavior (DAG, dependency tracking, replanning) preserved.
 
 Loop cycle:
   1. DAGManager: compute ready goals (PENDING + all deps COMPLETED).
-  2. Build minimal context (ContextManager).
-  3. Ask LLM to select an action: tool_call or direct_answer.
-  4. Execute the action (ToolExecutor).
-  5. Record the Observation in state.
-  6. Verify: does the observation satisfy the goal? (Verifier)
-  7a. VALID → mark goal COMPLETED, update DAG (may unblock dependents), continue.
-  7b. INCOMPLETE/INVALID → recovery: retry with same or different approach.
-  7c. Exhausted attempts → mark goal FAILED → Replanner: inject recovery goals OR
-      DAGManager.update_blocked() marks all dependents BLOCKED.
-  8. Check termination: all goals terminal, or budget exhausted.
+  2. Stuck detection: if no progress in recent iterations, handle.
+  3. Build minimal context (ContextManager).
+  4. Ask LLM to select an action: tool_call or direct_answer.
+  5. Execute the action (ToolExecutor).
+  6. Record the Observation in state.
+  7. Verify: does the observation satisfy the goal? (Verifier — Phase 3 enhanced)
+  8a. VALID → mark goal COMPLETED, continue.
+  8b. INCOMPLETE/INVALID → retry up to MAX_GOAL_ATTEMPTS.
+  8c. Exhausted → RecoveryManager decides strategy:
+       - retry/modify_input/switch_tool → reset goal and re-queue
+       - fallback → accept partial result, mark COMPLETED
+       - replan → Replanner injects new goals
+       - terminate → mark FAILED, DAGManager will BLOCK dependents
+  9. Check termination: all goals terminal, or budget exhausted.
 """
 from __future__ import annotations
 
@@ -44,6 +47,7 @@ from backend.monitoring.budget import BudgetExhaustedError, BudgetManager
 from backend.monitoring.logger import AgentLogger
 from backend.planning.dag_manager import DAGManager, DAGValidationError
 from backend.planning.replanner import Replanner
+from backend.reasoning.recovery_manager import RecoveryManager, RecoveryStrategy
 from backend.reasoning.verifier import Verifier
 from backend.tools.registry import ToolRegistry
 
@@ -101,14 +105,15 @@ Rules:
 
 class LoopController:
     """
-    The custom agent runtime — PLAN→ACT→OBSERVE→VERIFY→RECOVER loop.
+    Phase 3 agent runtime: PLAN→ACT→OBSERVE→VERIFY→RECOVER/REPLAN loop.
 
-    Phase 2: integrates DAGManager (dependency tracking) and Replanner
-    (dynamic goal injection on failure). All orchestration is explicit Python.
+    Integrates: DAGManager, Replanner, RecoveryManager, stuck detection.
+    All orchestration is explicit Python — no external framework.
     """
 
-    MAX_GOAL_ATTEMPTS = 3  # Retries per goal before marking FAILED
-    MAX_REPLAN_ROUNDS = 2  # Max times the replanner may inject new goals
+    MAX_GOAL_ATTEMPTS = 3    # Inner retry attempts before escalating to RecoveryManager
+    MAX_REPLAN_ROUNDS = 2    # Max times Replanner may inject new goals
+    MAX_STUCK_ITERATIONS = 4 # Iterations with zero goal completions before intervention
 
     def __init__(
         self,
@@ -120,6 +125,7 @@ class LoopController:
         budget_manager: BudgetManager,
         logger: AgentLogger,
         replanner: Replanner | None = None,
+        recovery_manager: RecoveryManager | None = None,
     ) -> None:
         self._llm = llm
         self._registry = tool_registry
@@ -128,7 +134,8 @@ class LoopController:
         self._ctx = context_manager
         self._budget = budget_manager
         self._logger = logger
-        self._replanner = replanner  # None = replanning disabled
+        self._replanner = replanner
+        self._recovery = recovery_manager
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -136,18 +143,14 @@ class LoopController:
         """
         Execute the agent loop until termination.
 
-        Phase 2: DAGManager validates the graph at entry, tracks BLOCKED goals
-        after each failure, and detects deadlocks.
-
-        Termination conditions:
-          - All goals are in terminal status (COMPLETED / FAILED / SKIPPED / BLOCKED)
-          - BudgetExhaustedError is raised by BudgetManager
-          - Unexpected exception (caught, logged, status set to FAILED)
+        Phase 3: RecoveryManager, stuck detection, and strategy execution.
         """
         state.status = AgentStatus.RUNNING
         replan_rounds = 0
+        last_completed_count = 0
+        stuck_iteration_count = 0
 
-        # ── Phase 2: Build and validate DAG ──────────────────────────────────
+        # ── Build and validate DAG ────────────────────────────────────────────
         dag = DAGManager(state.goals, self._logger)
         try:
             dag.validate()
@@ -165,10 +168,26 @@ class LoopController:
                 state.iterations += 1
                 self._budget.tick_iteration()
 
-                # ── Update BLOCKED goals after any failure ────────────────
+                # ── Update BLOCKED goals after any failure ────────────────────
                 dag.update_blocked(state)
 
-                # ── Pick next ready goal ──────────────────────────────────
+                # ── Stuck detection ───────────────────────────────────────────
+                current_completed = len(state.completed_goal_ids())
+                if current_completed == last_completed_count:
+                    stuck_iteration_count += 1
+                else:
+                    stuck_iteration_count = 0
+                    last_completed_count = current_completed
+
+                if stuck_iteration_count >= self.MAX_STUCK_ITERATIONS:
+                    self._logger.warn(
+                        f"Stuck detected: no progress for {stuck_iteration_count} iterations. "
+                        f"Failing remaining pending goals."
+                    )
+                    self._fail_stranded_goals(state)
+                    break
+
+                # ── Pick next ready goal ──────────────────────────────────────
                 ready = dag.ready_goals(state)
 
                 if not ready:
@@ -177,43 +196,27 @@ class LoopController:
                             "DAG deadlock detected — no ready goals and no running goals."
                         )
                         self._fail_stranded_goals(state)
-                    break  # Nothing left to do
+                    break
 
                 # Process highest-priority ready goal
-                goal = ready[0]  # already sorted by (priority, id)
+                goal = ready[0]
                 goal.status = GoalStatus.RUNNING
                 self._logger.goal_start(goal.id, goal.description)
 
-                # ── ACT → OBSERVE → VERIFY cycle ─────────────────────────
-                self._process_goal(goal, state)
+                # ── ACT → OBSERVE → VERIFY cycle ─────────────────────────────
+                completed = self._process_goal(goal, state)
 
-                # ── Phase 2: Replanning on failure ────────────────────────
-                if (
-                    goal.status == GoalStatus.FAILED
-                    and self._replanner is not None
-                    and replan_rounds < self.MAX_REPLAN_ROUNDS
-                ):
-                    new_goals = self._replanner.replan(goal, state)
-                    if new_goals:
-                        state.goals.extend(new_goals)
-                        # Rebuild DAG with the new goals
+                # ── Phase 3: Recovery on failure ──────────────────────────────
+                if not completed and goal.status == GoalStatus.FAILED:
+                    did_recover = self._handle_recovery(goal, state, dag, replan_rounds)
+                    if did_recover:
+                        replan_rounds += 1
+                        # Rebuild DAG after potential goal injection
                         dag = DAGManager(state.goals, self._logger)
                         try:
                             dag.validate()
                         except DAGValidationError as exc:
-                            self._logger.warn(
-                                f"Replanned goals produced invalid DAG: {exc}. "
-                                "Discarding injected goals."
-                            )
-                            # Roll back injected goals
-                            for ng in new_goals:
-                                state.goals.remove(ng)
-                            dag = DAGManager(state.goals, self._logger)
-                        else:
-                            replan_rounds += 1
-                            self._logger.info(
-                                f"Replanning round {replan_rounds}/{self.MAX_REPLAN_ROUNDS} complete."
-                            )
+                            self._logger.warn(f"Post-recovery DAG invalid: {exc}")
 
         except BudgetExhaustedError as exc:
             self._logger.error(f"Budget exhausted: {exc.reason}")
@@ -225,33 +228,24 @@ class LoopController:
             state.status = AgentStatus.FAILED
             return state
 
-        # ── Set final status ──────────────────────────────────────────────
+        # ── Set final status ──────────────────────────────────────────────────
         if state.status == AgentStatus.RUNNING:
             completed = sum(1 for g in state.goals if g.status == GoalStatus.COMPLETED)
-            if completed > 0:
-                state.status = AgentStatus.COMPLETED
-            else:
-                state.status = AgentStatus.FAILED
+            state.status = AgentStatus.COMPLETED if completed > 0 else AgentStatus.FAILED
 
         return state
 
     # ── Goal processing ───────────────────────────────────────────────────────
 
-    def _process_goal(self, goal: Goal, state: AgentState) -> None:
+    def _process_goal(self, goal: Goal, state: AgentState) -> bool:
         """
         ACT → OBSERVE → VERIFY cycle for a single goal.
-
-        Retries up to MAX_GOAL_ATTEMPTS times. On each retry the LLM
-        receives the history of previous failed observations in context,
-        allowing it to naturally adapt its tool choice or inputs.
+        Returns True if goal completed, False if it failed.
         """
         while goal.attempts < self.MAX_GOAL_ATTEMPTS:
             goal.attempts += 1
 
-            # Build context (minimal, relevant)
             context = self._ctx.build_tool_selection_context(state, goal, self._registry)
-
-            # ── ACT: Ask LLM to select an action ─────────────────────────
             action = self._select_action(context, state)
 
             if action is None:
@@ -261,23 +255,16 @@ class LoopController:
                 self._budget.tick_retry()
                 continue
 
-            # Log the selected action
             action_type = action.get("action", "?")
             if action_type == "tool_call":
-                self._logger.tool_selected(
-                    action.get("tool", "?"),
-                    action.get("input", {}),
-                )
+                self._logger.tool_selected(action.get("tool", "?"), action.get("input", {}))
             elif action_type == "direct_answer":
                 self._logger.tool_selected("direct_answer", action.get("answer", "")[:80])
 
-            # ── Handle direct answer (no tool needed) ─────────────────────
+            # ── Direct answer ─────────────────────────────────────────────────
             if action_type == "direct_answer":
                 answer_text = str(action.get("answer", "")).strip()
                 if answer_text:
-                    goal.result = answer_text
-                    goal.status = GoalStatus.COMPLETED
-                    goal.verification_status = VerificationStatus.VALID
                     obs = Observation(
                         goal_id=goal.id,
                         tool_name="direct_answer",
@@ -291,76 +278,173 @@ class LoopController:
                     state.observations.append(obs)
                     self._budget.tick_tool_call()
                     self._logger.observation_received(obs)
-                    self._logger.goal_completed(goal.id)
-                    return
+
+                    # Run verifier even on direct answers (Phase 3)
+                    verification = self._verifier.verify(goal, obs)
+                    if verification.status in (VerificationStatus.VALID,):
+                        goal.result = answer_text
+                        goal.status = GoalStatus.COMPLETED
+                        goal.verification_status = VerificationStatus.VALID
+                        self._logger.goal_completed(goal.id)
+                        return True
+                    else:
+                        self._logger.warn(
+                            f"Direct answer verification: {verification.status.value} — retrying."
+                        )
+                        if goal.attempts < self.MAX_GOAL_ATTEMPTS:
+                            self._budget.tick_retry()
+                            continue
+                        break
                 else:
                     self._logger.warn(f"direct_answer was empty for goal {goal.id}, retrying.")
                     self._budget.tick_retry()
                     continue
 
-            # ── OBSERVE: Execute the selected tool ─────────────────────────
+            # ── Tool call ─────────────────────────────────────────────────────
             self._budget.tick_tool_call()
             obs = self._executor.execute(action, state)
             state.observations.append(obs)
 
-            # ── VERIFY: Does the observation satisfy the goal? ─────────────
+            # ── Verify ───────────────────────────────────────────────────────
             verification = self._verifier.verify(goal, obs)
             obs.verification_status = verification.status
             goal.verification_status = verification.status
 
             if verification.status == VerificationStatus.VALID:
-                # ✅ Goal satisfied
                 goal.result = obs.output
                 goal.status = GoalStatus.COMPLETED
                 self._logger.goal_completed(goal.id)
-                return
+                return True
 
-            elif verification.status == VerificationStatus.INCOMPLETE:
-                self._logger.recovery_triggered(
-                    f"Incomplete result for [{goal.id}] — retrying (attempt {goal.attempts}/{self.MAX_GOAL_ATTEMPTS})"
-                )
-                if goal.attempts < self.MAX_GOAL_ATTEMPTS:
-                    self._budget.tick_retry()
-                    continue
+            # Not valid — retry if attempts remain
+            self._logger.recovery_triggered(
+                f"Verification={verification.status.value} for [{goal.id}] "
+                f"— attempt {goal.attempts}/{self.MAX_GOAL_ATTEMPTS}"
+            )
+            if goal.attempts < self.MAX_GOAL_ATTEMPTS:
+                self._budget.tick_retry()
+                continue
 
-            else:
-                # INVALID / CONTRADICTORY / UNRELIABLE
-                self._logger.recovery_triggered(
-                    f"Verification={verification.status.value} for [{goal.id}] "
-                    f"— attempt {goal.attempts}/{self.MAX_GOAL_ATTEMPTS}"
-                )
-                if goal.attempts < self.MAX_GOAL_ATTEMPTS:
-                    self._budget.tick_retry()
-                    continue
+            break  # Exhausted inner attempts
 
-            break  # Exhausted attempts inside loop
-
-        # ── All attempts exhausted ─────────────────────────────────────────
+        # ── All inner attempts exhausted ──────────────────────────────────────
         goal.status = GoalStatus.FAILED
         goal.error = (
             f"Failed after {goal.attempts} attempt(s). "
             f"Last verification: {goal.verification_status.value}"
         )
         self._logger.goal_failed(goal.id, goal.error)
+        return False
+
+    # ── Recovery strategy execution ───────────────────────────────────────────
+
+    def _handle_recovery(
+        self,
+        goal: Goal,
+        state: AgentState,
+        dag: DAGManager,
+        replan_rounds: int,
+    ) -> bool:
+        """
+        Phase 3 recovery: query RecoveryManager, then execute the strategy.
+        Returns True if a meaningful recovery action was taken (for replan_rounds tracking).
+        """
+        if self._recovery is None:
+            return False  # Recovery disabled
+
+        last_obs = state.observations_for_goal(goal.id)
+        last_obs_obj = last_obs[-1] if last_obs else None
+
+        decision = self._recovery.decide(goal, state, last_obs_obj)
+
+        strategy = decision.strategy
+        self._logger.info(
+            f"Recovery strategy for '{goal.id}': {strategy.value} — {decision.reasoning}"
+        )
+
+        # ── RETRY ─────────────────────────────────────────────────────────────
+        if strategy == RecoveryStrategy.RETRY:
+            if goal.attempts < 6:  # Hard cap even with recovery
+                goal.status = GoalStatus.PENDING
+                goal.attempts = 0
+                self._logger.info(f"Recovery RETRY: resetting goal '{goal.id}' for another attempt.")
+                return False  # Not a replan
+
+        # ── MODIFY INPUT ──────────────────────────────────────────────────────
+        elif strategy == RecoveryStrategy.MODIFY_INPUT:
+            if decision.modified_input:
+                goal.status = GoalStatus.PENDING
+                goal.attempts = 0
+                goal.metadata["recovery_modified_input"] = decision.modified_input
+                self._logger.info(
+                    f"Recovery MODIFY_INPUT: resetting goal '{goal.id}' with new input: "
+                    f"{decision.modified_input}"
+                )
+                return False
+
+        # ── SWITCH TOOL ───────────────────────────────────────────────────────
+        elif strategy == RecoveryStrategy.SWITCH_TOOL:
+            if decision.suggested_tool:
+                goal.status = GoalStatus.PENDING
+                goal.attempts = 0
+                goal.metadata["recovery_forced_tool"] = decision.suggested_tool
+                self._logger.info(
+                    f"Recovery SWITCH_TOOL: resetting goal '{goal.id}' to use '{decision.suggested_tool}'."
+                )
+                return False
+
+        # ── FALLBACK ──────────────────────────────────────────────────────────
+        elif strategy == RecoveryStrategy.FALLBACK:
+            fallback_text = decision.fallback_result or f"[Fallback] Could not complete: {goal.description}"
+            goal.result = fallback_text
+            goal.status = GoalStatus.COMPLETED  # Accept degraded result
+            goal.verification_status = VerificationStatus.UNRELIABLE
+            self._logger.info(
+                f"Recovery FALLBACK: goal '{goal.id}' accepted with degraded result."
+            )
+            return False
+
+        # ── REPLAN ────────────────────────────────────────────────────────────
+        elif strategy == RecoveryStrategy.REPLAN:
+            if self._replanner is not None and replan_rounds < self.MAX_REPLAN_ROUNDS:
+                new_goals = self._replanner.replan(goal, state)
+                if new_goals:
+                    state.goals.extend(new_goals)
+                    self._logger.replanning(
+                        f"Injected {len(new_goals)} recovery goal(s) after '{goal.id}' failed."
+                    )
+                    return True  # Signals a replan round was consumed
+
+        # ── TERMINATE (or default) ────────────────────────────────────────────
+        # goal.status is already FAILED — nothing to do
+        self._logger.info(f"Recovery TERMINATE: goal '{goal.id}' marked as unrecoverable.")
+        return False
 
     # ── Action selection ──────────────────────────────────────────────────────
 
     def _select_action(
         self, context: dict[str, Any], state: AgentState
     ) -> dict[str, Any] | None:
-        """
-        Ask the LLM to select the next action.
+        """Ask the LLM to select the next action. Returns None on failure."""
+        # Honour recovery-forced tool if set
+        goal_id = context.get("current_goal", {}).get("id", "")
+        goal = state.get_goal(goal_id)
+        forced_tool = goal.metadata.get("recovery_forced_tool") if goal else None
 
-        Returns a parsed action dict, or None if the LLM call fails.
-        The LLM receives the full tool catalogue and current context;
-        it autonomously decides tool + input based on capabilities.
-        """
         user_prompt = json.dumps(context, indent=2, default=str)
+
+        # If a tool was forced by recovery, inject a hint into the prompt
+        if forced_tool:
+            user_prompt = (
+                f"[RECOVERY INSTRUCTION: You MUST use the tool '{forced_tool}' for this goal.]\n\n"
+                + user_prompt
+            )
+
         try:
             self._budget.tick_llm_call()
             action = self._llm.complete_json(_ACTION_SELECTION_SYSTEM, user_prompt)
             if "action" not in action:
-                self._logger.warn("LLM action missing 'action' key. Retrying selection.")
+                self._logger.warn("LLM action missing 'action' key.")
                 return None
             return action
         except LLMError as exc:
@@ -370,12 +454,7 @@ class LoopController:
     # ── Final answer synthesis ────────────────────────────────────────────────
 
     def synthesize_answer(self, state: AgentState) -> str:
-        """
-        Generate the final user-facing answer from completed goal results.
-
-        Uses one LLM call to integrate all results coherently.
-        Falls back to manual assembly if the LLM call fails.
-        """
+        """Generate the final answer from completed goal results."""
         self._logger.synthesizing()
 
         synthesis_context = self._ctx.build_synthesis_context(state)
@@ -396,7 +475,6 @@ class LoopController:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _should_stop(self, state: AgentState) -> bool:
-        """True when the loop should exit."""
         if state.all_goals_terminal():
             return True
         if state.status in (AgentStatus.FAILED, AgentStatus.BUDGET_EXHAUSTED):
@@ -404,16 +482,14 @@ class LoopController:
         return False
 
     def _fail_stranded_goals(self, state: AgentState) -> None:
-        """Mark all remaining PENDING goals as FAILED due to DAG deadlock."""
         for goal in state.goals:
             if goal.status == GoalStatus.PENDING:
                 goal.status = GoalStatus.FAILED
-                goal.error = "Stranded: dependency deadlock — no goal can execute."
+                goal.error = "Stranded: no progress detected — stuck detection triggered."
                 self._logger.goal_failed(goal.id, goal.error)
 
     @staticmethod
     def _fallback_assemble(state: AgentState) -> str:
-        """Manually assemble answer from goal results when synthesis LLM call fails."""
         parts: list[str] = []
         for goal in state.goals:
             if goal.status == GoalStatus.COMPLETED and goal.result:

@@ -139,7 +139,7 @@ class AgentState:
 
     def all_goals_terminal(self) -> bool:
         """True if every goal is in a terminal state (no more work to do)."""
-        terminal = {GoalStatus.COMPLETED, GoalStatus.FAILED, GoalStatus.SKIPPED}
+        terminal = {GoalStatus.COMPLETED, GoalStatus.FAILED, GoalStatus.SKIPPED, GoalStatus.BLOCKED}
         return bool(self.goals) and all(g.status in terminal for g in self.goals)
 
     # ── Observation accessors ─────────────────────────────────────────────────
