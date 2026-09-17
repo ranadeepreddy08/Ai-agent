@@ -1,0 +1,48 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Test/cache/coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+
+# Generated test outputs/logs
+test_outputs/
+test_output/
+logs/
+*.log
+
+# IDE/editor files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build/cache
+dist/
+build/
+*.egg-info/
+
+# Node/frontend artifacts (for the future React dashboard)
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Temporary files
+*.tmp
+*.temp
