@@ -1,5 +1,5 @@
-"""
-Async Loop Controller — Phase 4 parallel execution engine.
+﻿"""
+Async Loop Controller â€” Phase 4 parallel execution engine.
 
 Implements TRUE parallel execution of independent goals using asyncio:
   - Goals with no dependencies between them run CONCURRENTLY via asyncio.gather()
@@ -13,7 +13,7 @@ Architecture:
     (Groq client is sync; we don't block the event loop)
   - The main loop continually asks: "What goals are READY RIGHT NOW?"
     and launches all ready goals as concurrent asyncio Tasks
-  - Each goal task runs its own ACT → OBSERVE → VERIFY → RECOVER cycle
+  - Each goal task runs its own ACT â†’ OBSERVE â†’ VERIFY â†’ RECOVER cycle
   - When a goal completes/fails, the loop rechecks for newly unblocked goals
 
 Phases 1-3 behavior is FULLY PRESERVED:
@@ -22,11 +22,11 @@ Phases 1-3 behavior is FULLY PRESERVED:
   - RecoveryManager (Phase 3 LLM-driven strategies)
   - Replanner (Phase 2 goal injection)
   - BudgetManager (hard limits on iterations, LLM calls, time)
-  - StuckDetector (Phase 4 standalone — replaces inline stuck detection)
+  - StuckDetector (Phase 4 standalone â€” replaces inline stuck detection)
 
 Entry points:
-  run()       — synchronous wrapper (calls asyncio.run on run_async)
-  run_async() — pure async; can be awaited from other async code
+  run()       â€” synchronous wrapper (calls asyncio.run on run_async)
+  run_async() â€” pure async; can be awaited from other async code
 """
 from __future__ import annotations
 
@@ -54,14 +54,14 @@ from backend.reasoning.recovery_manager import RecoveryManager, RecoveryStrategy
 from backend.reasoning.verifier import Verifier
 from backend.tools.registry import ToolRegistry
 
-# ── Prompts (same as Phase 3 LoopController) ─────────────────────────────────
+# â”€â”€ Prompts (same as Phase 3 LoopController) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _ACTION_SELECTION_SYSTEM = """You are the action selection module of an AI agent runtime.
 
 Given the current goal and available tools, decide the NEXT action to take.
 
 You MUST return ONLY valid JSON in one of these two formats:
 
-Option A — Use a tool:
+Option A â€” Use a tool:
 {
   "action": "tool_call",
   "tool": "<exact tool name from available_tools list>",
@@ -70,7 +70,7 @@ Option A — Use a tool:
   "reasoning": "why this tool and input"
 }
 
-Option B — Answer directly (no tool needed):
+Option B â€” Answer directly (no tool needed):
 {
   "action": "direct_answer",
   "answer": "<complete answer text>",
@@ -91,13 +91,27 @@ Rules:
 _SYNTHESIS_SYSTEM = """You are the response synthesizer for an AI agent runtime.
 
 Given the original task and the results from completed goals, write a clear,
-accurate, and concise final answer for the user.
+complete, and well-formatted final answer for the user.
 
-Rules:
-  - Integrate all relevant results naturally.
-  - Be specific: include numbers, names, and facts from the results.
-  - If some goals failed or were blocked, acknowledge what could not be determined.
+Formatting rules:
+  - Use Markdown: **bold** for key results, ## headings to separate sections.
+  - For calculations: show the step-by-step arithmetic, then state the final
+    answer prominently with **bold**.
+  - For multi-goal tasks: use clear section headings for each part.
+  - Be concise — do not pad simple answers with unnecessary explanation.
+  - Include the actual numbers, names, and facts from the goal results.
+  - If a goal failed or was blocked, acknowledge what could not be determined.
   - Do NOT fabricate information not present in the goal results.
+  - Do NOT truncate your response — always complete every sentence and the
+    final answer statement.
+  - End with a clear, prominent statement of the result.
+
+Example for a calculation task:
+  ## Calculation
+  25 x 47 = **1,175**
+  1,175 + 100 = **1,275**
+  ## Answer
+  **1,275**
 """
 
 # How many times a goal may attempt before escalating to RecoveryManager
@@ -145,10 +159,10 @@ class AsyncLoopController:
             max_repeated_observations=3,
         )
 
-    # ── Public entry points ────────────────────────────────────────────────────
+    # â”€â”€ Public entry points â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def run(self, state: AgentState) -> AgentState:
-        """Synchronous wrapper — calls asyncio.run(run_async(state))."""
+        """Synchronous wrapper â€” calls asyncio.run(run_async(state))."""
         return asyncio.run(self.run_async(state))
 
     async def run_async(self, state: AgentState) -> AgentState:
@@ -164,7 +178,7 @@ class AsyncLoopController:
             dag.validate()
             topo = dag.topo_order()
             self._logger.info(
-                f"DAG validated. Topological order: {' → '.join(topo)}"
+                f"DAG validated. Topological order: {' â†’ '.join(topo)}"
             )
         except DAGValidationError as exc:
             self._logger.error(f"DAG validation failed: {exc}")
@@ -191,7 +205,7 @@ class AsyncLoopController:
 
         return state
 
-    # ── Coordinator ────────────────────────────────────────────────────────────
+    # â”€â”€ Coordinator â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _coordinator(
         self,
@@ -211,20 +225,20 @@ class AsyncLoopController:
           5. Wait for at least one task to finish (asyncio.FIRST_COMPLETED).
           6. Repeat until all goals are terminal.
         """
-        running_tasks: dict[str, asyncio.Task] = {}  # goal_id → Task
+        running_tasks: dict[str, asyncio.Task] = {}  # goal_id â†’ Task
 
         while True:
             self._budget.tick_iteration()
             state.iterations += 1
 
-            # ── Phase 4 iteration marker ──────────────────────────────────────
+            # â”€â”€ Phase 4 iteration marker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             self._logger.p4_loop(state.iterations)
 
-            # ── Update BLOCKED ────────────────────────────────────────────────
+            # â”€â”€ Update BLOCKED â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             async with lock:
                 dag.update_blocked(state)
 
-            # ── Stuck detection ───────────────────────────────────────────────
+            # â”€â”€ Stuck detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             stuck_result = self._stuck.check(state)
             # Log stuck status each iteration for demo clarity
             self._logger.p4_stuck(
@@ -237,7 +251,7 @@ class AsyncLoopController:
                     self._fail_stranded_goals(state)
                 break
 
-            # ── Budget checkpoint ─────────────────────────────────────────────
+            # â”€â”€ Budget checkpoint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             bused = self._budget.summary()
             bcfg  = self._budget.config
             self._logger.p4_budget(
@@ -249,12 +263,12 @@ class AsyncLoopController:
                 },
             )
 
-            # ── Check termination ─────────────────────────────────────────────
+            # â”€â”€ Check termination â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             if state.all_goals_terminal() and not running_tasks:
                 self._logger.p4_loop(state.iterations, "All goals completed")
                 break
 
-            # ── Find and launch ready goals ───────────────────────────────────
+            # â”€â”€ Find and launch ready goals â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             async with lock:
                 ready = dag.ready_goals(state)
                 ready_ids = [g.id for g in ready if g.id not in running_tasks]
@@ -284,12 +298,12 @@ class AsyncLoopController:
             if not running_tasks:
                 # Deadlock or all done
                 if dag.is_deadlocked(state):
-                    self._logger.warn("DAG deadlock — failing stranded goals.")
+                    self._logger.warn("DAG deadlock â€” failing stranded goals.")
                     async with lock:
                         self._fail_stranded_goals(state)
                 break
 
-            # ── Wait for at least one task to complete ────────────────────────
+            # â”€â”€ Wait for at least one task to complete â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             done, _ = await asyncio.wait(
                 running_tasks.values(),
                 return_when=asyncio.FIRST_COMPLETED,
@@ -303,7 +317,7 @@ class AsyncLoopController:
                         f"Goal task '{goal_id}' raised unexpectedly: {exc}"
                     )
 
-    # ── Per-goal task ──────────────────────────────────────────────────────────
+    # â”€â”€ Per-goal task â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _process_goal(
         self,
@@ -314,7 +328,7 @@ class AsyncLoopController:
         replan_rounds: list[int],
     ) -> None:
         """
-        Async per-goal runner: ACT → OBSERVE → VERIFY → RECOVER cycle.
+        Async per-goal runner: ACT â†’ OBSERVE â†’ VERIFY â†’ RECOVER cycle.
 
         Runs concurrently with other independent goal tasks.
         Uses the lock only when mutating shared state.
@@ -322,7 +336,7 @@ class AsyncLoopController:
         while goal.attempts < _MAX_GOAL_ATTEMPTS:
             goal.attempts += 1
 
-            # ── Build context (read-only — no lock needed) ────────────────────
+            # â”€â”€ Build context (read-only â€” no lock needed) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             context = self._ctx.build_tool_selection_context(state, goal, self._registry)
 
             # Honour recovery-forced tool
@@ -334,7 +348,7 @@ class AsyncLoopController:
                     f"for this goal.]\n\n" + user_prompt
                 )
 
-            # ── Action selection (LLM call in thread pool) ────────────────────
+            # â”€â”€ Action selection (LLM call in thread pool) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             action = await self._select_action_async(user_prompt)
 
             if action is None:
@@ -350,7 +364,7 @@ class AsyncLoopController:
             else:
                 self._logger.tool_selected("direct_answer", action.get("answer", "")[:80])
 
-            # ── Direct answer ─────────────────────────────────────────────────
+            # â”€â”€ Direct answer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             if action_type == "direct_answer":
                 answer_text = str(action.get("answer", "")).strip()
                 if answer_text:
@@ -378,7 +392,7 @@ class AsyncLoopController:
                         return
                     else:
                         self._logger.warn(
-                            f"Direct answer verification {verification.status.value} — retrying."
+                            f"Direct answer verification {verification.status.value} â€” retrying."
                         )
                         if goal.attempts < _MAX_GOAL_ATTEMPTS:
                             async with lock:
@@ -392,7 +406,7 @@ class AsyncLoopController:
                         continue
                     break
 
-            # ── Tool call ─────────────────────────────────────────────────────
+            # â”€â”€ Tool call â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             async with lock:
                 self._budget.tick_tool_call()
 
@@ -414,7 +428,7 @@ class AsyncLoopController:
 
             self._logger.recovery_triggered(
                 f"Verification={verification.status.value} for [{goal.id}] "
-                f"— attempt {goal.attempts}/{_MAX_GOAL_ATTEMPTS}"
+                f"â€” attempt {goal.attempts}/{_MAX_GOAL_ATTEMPTS}"
             )
             if goal.attempts < _MAX_GOAL_ATTEMPTS:
                 async with lock:
@@ -424,7 +438,7 @@ class AsyncLoopController:
 
             break  # Exhausted inner attempts
 
-        # ── Inner attempts exhausted — escalate to RecoveryManager ────────────
+        # â”€â”€ Inner attempts exhausted â€” escalate to RecoveryManager â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         async with lock:
             goal.status = GoalStatus.FAILED
             goal.error = (
@@ -500,9 +514,9 @@ class AsyncLoopController:
                         self._stuck.reset_stagnation()
                     return
 
-                # TERMINATE or unhandled — goal stays FAILED
+                # TERMINATE or unhandled â€” goal stays FAILED
 
-    # ── Action selection (async LLM) ──────────────────────────────────────────
+    # â”€â”€ Action selection (async LLM) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _select_action_async(self, user_prompt: str) -> dict[str, Any] | None:
         """Run the sync LLM call in a thread pool."""
@@ -524,7 +538,7 @@ class AsyncLoopController:
             self._logger.error(f"Action selection LLM call failed: {exc}")
             return None
 
-    # ── Final answer synthesis ────────────────────────────────────────────────
+    # â”€â”€ Final answer synthesis â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def synthesize_answer_async(self, state: AgentState) -> str:
         """Async synthesis: run sync LLM call in thread pool."""
@@ -552,7 +566,7 @@ class AsyncLoopController:
         """Sync wrapper for synthesize_answer_async."""
         return asyncio.run(self.synthesize_answer_async(state))
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _fail_stranded_goals(self, state: AgentState) -> None:
         for goal in state.goals:
