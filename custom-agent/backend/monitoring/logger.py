@@ -4,13 +4,14 @@ Agent trace logger — structured, emoji-annotated terminal output.
 Phase 1: Colored terminal trace.
 Phase 4: Added p4_loop/p4_dag/p4_executor/p4_budget/p4_stuck for the
          structured demo trace that makes the parallel execution visible.
-Phase 5: Each _emit() call will also push a JSON event to a WebSocket queue
-         for the React dashboard (hook point marked with TODO: PHASE 5).
+Phase 5: Each _emit() call also pushes a JSON event to an asyncio.Queue
+         for the React dashboard WebSocket stream.
 
 Design: Logger is injected into every component. Never imported as a singleton.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from typing import Any, TYPE_CHECKING
 
@@ -38,11 +39,41 @@ class AgentLogger:
     Every significant decision, action, and state change in the agent loop
     produces an emoji-annotated log line. This is what makes the agent
     observable without adding external telemetry.
+
+    Phase 5: If an asyncio.Queue is attached via set_event_queue(), each
+    _emit() call also pushes a JSON-serialisable event dict to that queue.
+    The queue is consumed by the WebSocket handler and forwarded to the
+    React dashboard in real time.
     """
 
     def __init__(self, verbose: bool = True) -> None:
         self.verbose = verbose
-        self._events: list[dict[str, Any]] = []  # For Phase 5 WebSocket export
+        self._events: list[dict[str, Any]] = []  # In-memory event log
+        self._event_queue: asyncio.Queue | None = None  # Phase 5 WebSocket queue
+        self._event_loop: asyncio.AbstractEventLoop | None = None
+
+    # ── Phase 5: queue management ─────────────────────────────────────────────
+
+    def set_event_queue(
+        self,
+        queue: asyncio.Queue | None,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> None:
+        """
+        Attach (or detach) an asyncio.Queue for WebSocket streaming.
+
+        Call this before starting an agent run to enable live event streaming.
+        Pass queue=None to detach (e.g. after run finishes).
+
+        Args:
+            queue: The queue to push events to, or None to disable.
+            loop:  The event loop that owns the queue. Required when the
+                   agent runs in a thread-pool (so we can use
+                   call_soon_threadsafe). If None, falls back to
+                   asyncio.get_event_loop().
+        """
+        self._event_queue = queue
+        self._event_loop = loop
 
     # ── Core emit ─────────────────────────────────────────────────────────────
 
@@ -60,7 +91,24 @@ class AgentLogger:
         if data:
             event["data"] = data
         self._events.append(event)
-        # TODO: PHASE 5 — push event to asyncio.Queue for WebSocket broadcast
+
+        # Phase 5 — push to WebSocket queue (thread-safe)
+        if self._event_queue is not None:
+            loop = self._event_loop
+            try:
+                if loop is not None and loop.is_running():
+                    loop.call_soon_threadsafe(self._event_queue.put_nowait, event)
+                else:
+                    # Best-effort fallback when running inside the same loop
+                    try:
+                        running = asyncio.get_running_loop()
+                        running.call_soon_threadsafe(
+                            self._event_queue.put_nowait, event
+                        )
+                    except RuntimeError:
+                        self._event_queue.put_nowait(event)
+            except Exception:
+                pass  # Never let queue errors break the agent
 
     # ── Planning ──────────────────────────────────────────────────────────────
 
@@ -83,7 +131,7 @@ class AgentLogger:
             deps = f" → requires: {', '.join(g.dependencies)}" if g.dependencies else ""
             print(f"   {BLUE}• [{g.id}] p{g.priority}: {g.description}{deps}{RST}")
 
-    # ── Goal lifecycle ────────────────────────────────────────────────────────
+    # ── Goal lifecycle ────────────────────────────────────────────────        
 
     def goal_start(self, goal_id: str, description: str) -> None:
         self._emit("▶️ ", YELL + BOLD, f"[{goal_id}] {description}")
@@ -158,6 +206,8 @@ class AgentLogger:
         print(f"{GREEN}{BOLD}FINAL ANSWER:{RST}")
         print(f"{WHITE}{answer}{RST}")
         print(f"{GREEN}{BOLD}{bar}{RST}")
+        # Also emit as a structured event for the dashboard
+        self._emit("🏁", GREEN + BOLD, f"Final answer: {answer[:200]}")
 
     def budget_summary(self, summary: dict) -> None:
         self._emit(
@@ -218,8 +268,12 @@ class AgentLogger:
                 f"[STUCK] NOT_STUCK" + (f" — {detail}" if detail else ""),
             )
 
-    # ── Event export (Phase 5 hook) ───────────────────────────────────────────
+    # ── Event export ──────────────────────────────────────────────────────────
 
     def get_events(self) -> list[dict[str, Any]]:
-        """Return all logged events (for WebSocket broadcast in Phase 5)."""
-        return self._events
+        """Return all logged events (for WebSocket broadcast / polling)."""
+        return list(self._events)
+
+    def clear_events(self) -> None:
+        """Reset the in-memory event log (call before a new run)."""
+        self._events.clear()
