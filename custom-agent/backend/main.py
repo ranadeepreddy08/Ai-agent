@@ -62,7 +62,7 @@ _P2_TASKS = [
 _P3_TASKS = [
     "Calculate sqrt(144) using the calculator and confirm the result is valid.",
     (
-        "Search for 'Python programming language features 2024' and summarize "
+        "Search for 'Python programming language features' and summarize "
         "the top findings."
     ),
     (

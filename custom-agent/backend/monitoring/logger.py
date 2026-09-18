@@ -207,7 +207,7 @@ class AgentLogger:
         print(f"{WHITE}{answer}{RST}")
         print(f"{GREEN}{BOLD}{bar}{RST}")
         # Also emit as a structured event for the dashboard
-        self._emit("🏁", GREEN + BOLD, f"Final answer: {answer[:200]}")
+        self._emit("🏁", GREEN + BOLD, f"Final answer: {answer}")
 
     def budget_summary(self, summary: dict) -> None:
         self._emit(

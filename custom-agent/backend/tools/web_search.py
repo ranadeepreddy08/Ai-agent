@@ -84,11 +84,11 @@ class MockSearchBackend(SearchBackend):
         ],
         "savings rate": [
             {
-                "title": "Best High-Yield Savings Accounts 2024",
+                "title": "Best High-Yield Savings Accounts",
                 "url": "https://example.com/savings-rates",
                 "snippet": (
-                    "Top high-yield savings accounts are currently offering 4.5% to 5.1% APY "
-                    "as of late 2024. Traditional bank savings accounts average 0.45% APY. "
+                    "Top high-yield savings accounts are currently offering 4.5% to 5.1% APY. "
+                    "Traditional bank savings accounts average 0.45% APY. "
                     "Online banks like Marcus, Ally, and SoFi lead with competitive rates."
                 ),
             },
@@ -247,7 +247,7 @@ class WebSearchTool(BaseTool):
             "type": "string",
             "description": (
                 "Search query string. Be specific and descriptive. "
-                "Example: 'current high-yield savings account interest rates 2024'"
+                "Example: 'current high-yield savings account interest rates'"
             ),
             "required": True,
         }

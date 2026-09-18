@@ -94,6 +94,7 @@ class LLMClient:
                     messages=messages,
                     response_format=response_format,
                     temperature=0.1,
+                    max_tokens=4096,
                     max_completion_tokens=4096,
                 )
                 self.total_calls += 1
