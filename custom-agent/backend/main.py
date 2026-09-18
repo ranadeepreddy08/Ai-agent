@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Adaptive Agent Runtime — CLI entry point (Phase 1 + Phase 2 + Phase 3)
+Adaptive Agent Runtime — CLI entry point (Phase 1 + Phase 2 + Phase 3 + Phase 4)
 
 Usage:
     python -m backend.main "Your task here"
     python -m backend.main               # interactive prompt
-    python -m backend.main --test        # Phase 1 test suite
+    python -m backend.main --test        # Phase 1 test suite (sequential)
     python -m backend.main --test-p2     # Phase 2 DAG + dependency tests
     python -m backend.main --test-p3     # Phase 3 recovery + reliability tests
+    python -m backend.main --test-p4     # Phase 4 parallel execution tests
     python -m backend.main --test-all    # all phases
 """
 from __future__ import annotations
@@ -39,19 +40,16 @@ _P1_TASKS = [
 
 # ── Phase 2 test tasks ─────────────────────────────────────────────────────────
 _P2_TASKS = [
-    # Sequential DAG with explicit dependencies
     (
         "First calculate what 15% of $8,500 is (use calculator). "
         "Then search for the current US federal income tax rate for that income bracket. "
         "Finally, tell me how the calculated amount compares to what the actual tax would be."
     ),
-    # Parallel then synthesis
     (
         "Simultaneously look up: (a) the formula for the area of a circle, "
         "and (b) search for the diameter of Earth in kilometers. "
         "Then calculate the area if Earth's surface were a flat circle with that diameter."
     ),
-    # 4-node deep chain
     (
         "Step 1: Calculate 2^10. "
         "Step 2: Using the result of step 1, calculate that result divided by 4. "
@@ -61,48 +59,74 @@ _P2_TASKS = [
 ]
 
 # ── Phase 3 test tasks ─────────────────────────────────────────────────────────
-# Phase 3 tests exercise: verification, tool failure detection, recovery,
-# retry limits, replanning after failure, and stuck detection.
-# Some tests register the FailingTool which is injected via a custom agent factory.
-
 _P3_TASKS = [
-    # P3-1: Normal task — verify the enhanced Phase 3 Verifier works on VALID result
     "Calculate sqrt(144) using the calculator and confirm the result is valid.",
-
-    # P3-2: Web search verification — Verifier accepts mock results as VALID
     (
         "Search for 'Python programming language features 2024' and summarize "
         "the top findings."
     ),
-
-    # P3-3: Calculator NaN detection — send an invalid expression
-    # Agent should observe the failure, trigger recovery, and recover
     (
         "I need to evaluate the math expression: '1 / 0'. "
         "If the calculator fails or returns an invalid result, "
         "explain why that operation is undefined in mathematics."
     ),
-
-    # P3-4: Multi-step with verification of each step
-    # (This also exercises that BLOCKED goals are correctly marked terminal)
     (
         "Step 1: Calculate 100 * 1.08^5 (compound growth). "
         "Step 2: Search for current S&P 500 average annual return. "
         "Step 3: Compare step 1 to step 2 and tell me if 8% growth is reasonable."
     ),
-
-    # P3-5: Stuck detection test
-    # A very ambiguous task that might produce no useful tool calls;
-    # the stuck detector should prevent infinite looping.
     (
         "Tell me the definitive answer to the ultimate question of life, "
         "the universe, and everything — using any tool you have available."
     ),
 ]
 
+# ── Phase 4 test tasks ─────────────────────────────────────────────────────────
+# These tasks exercise concurrent execution, context passing, budget, and stuck detection.
+
+_P4_TASKS = [
+    # P4-T1: TWO fully independent goals — should run CONCURRENTLY
+    # (calculator + web_search have no shared dependency)
+    (
+        "Do BOTH of these independently: "
+        "(a) Calculate 1234 * 5678 using the calculator. "
+        "(b) Search for the history of Python programming language. "
+        "Give me both results."
+    ),
+
+    # P4-T2: THREE independent goals followed by ONE synthesis goal that depends on all three
+    # Goal g1, g2, g3 should launch CONCURRENTLY; g4 waits for all three.
+    (
+        "Perform three independent lookups in parallel: "
+        "(a) Calculate 99 * 99. "
+        "(b) Search for the speed of light in km/s. "
+        "(c) Search for the distance from Earth to Moon in km. "
+        "Then, using all three results, calculate how long light takes to travel to the Moon."
+    ),
+
+    # P4-T3: CONTEXT PASSING — result of g1 feeds into g2's prompt
+    # The LLM should use the context of g1's result when selecting g2's tool input.
+    (
+        "Step 1: Calculate 2 ^ 8. "
+        "Step 2: Using the result from step 1, search for what that number means "
+        "in the context of computer memory (bytes, kilobytes, etc). "
+        "Summarize both findings."
+    ),
+
+    # P4-T4: BUDGET LIMIT — agent must stop within a very tight budget and report gracefully.
+    # (Handled via extra_cfg below in _run_budget_test)
+
+    # P4-T5: STUCK DETECTION — repeated task that generates no progress
+    # (Handled via _run_stuck_test below)
+
+    # P4-T6: RECOVERY STILL WORKS under async parallel loop
+    # (Handled via _run_p4_recovery_test below)
+]
+
 
 def _run_task(task: str, verbose: bool = True, extra_cfg: dict | None = None,
-              register_extra_tools: list | None = None) -> dict:
+              register_extra_tools: list | None = None,
+              use_parallel: bool = False) -> dict:
     """Run a single task and return the result dict."""
     cfg = {
         "max_iterations": 15,
@@ -117,24 +141,91 @@ def _run_task(task: str, verbose: bool = True, extra_cfg: dict | None = None,
         cfg.update(extra_cfg)
     agent = Agent(config=cfg, verbose=verbose)
 
-    # Register optional test-only tools (e.g. FailingTool for P3 tests)
     if register_extra_tools:
         for tool in register_extra_tools:
             agent.registry.register_if_absent(tool)
 
+    if use_parallel:
+        return agent.run_parallel(task)
     return agent.run(task)
 
 
-def _run_failing_tool_test() -> dict:
+def _run_p4_budget_test() -> dict:
     """
-    Phase 3 flagship test:
-    - Register FailingTool (fails 2 times, then succeeds on 3rd call)
-    - Ask agent to use it
-    - Agent must detect failures, trigger RecoveryManager, and eventually complete
+    P4: Budget-limit test.
+    Set max_llm_calls=3 — agent must stop gracefully within that budget
+    even for a complex multi-step task.
+    """
+    return _run_task(
+        task=(
+            "Calculate 100 * 200, search for information about quantum computing, "
+            "calculate 300 * 400, search for machine learning history, "
+            "and finally summarize everything."
+        ),
+        extra_cfg={
+            "max_llm_calls": 3,     # Very tight budget
+            "max_tool_calls": 2,
+            "max_iterations": 5,
+            "max_retries": 1,
+        },
+        use_parallel=True,
+    )
+
+
+def _run_p4_stuck_test() -> dict:
+    """
+    P4: Stuck detection test.
+    Inject FailingTool with 20 failures (always fails) and set a task
+    that forces repeated attempts. Stuck detector should kick in and
+    terminate gracefully — NOT loop forever.
     """
     from backend.tools.failing_tool import FailingTool
-    tool = FailingTool(fail_times=2, fail_message="Simulated network error — retry.")
+    tool = FailingTool(fail_times=20, fail_message="Permanent stuck error.")
 
+    return _run_task(
+        task=(
+            "Use the 'failing_tool' to get information. "
+            "Keep trying until you get a result."
+        ),
+        extra_cfg={
+            "max_iterations": 8,
+            "max_tool_calls": 12,
+            "max_llm_calls": 20,
+            "max_retries": 9,
+        },
+        register_extra_tools=[tool],
+        use_parallel=True,
+    )
+
+
+def _run_p4_recovery_test() -> dict:
+    """
+    P4: Recovery under async loop.
+    FailingTool fails 2x then succeeds — proves recovery works in parallel loop.
+    """
+    from backend.tools.failing_tool import FailingTool
+    tool = FailingTool(fail_times=2, fail_message="Async recovery test error.")
+
+    return _run_task(
+        task=(
+            "Use the 'failing_tool' to retrieve information about AI. "
+            "If it fails, detect the failure and retry until it works."
+        ),
+        extra_cfg={
+            "max_iterations": 10,
+            "max_tool_calls": 12,
+            "max_llm_calls": 25,
+            "max_retries": 9,
+        },
+        register_extra_tools=[tool],
+        use_parallel=True,
+    )
+
+
+def _run_p3_failing_tool_test() -> dict:
+    """Phase 3 flagship test: FailingTool fails 2x then succeeds."""
+    from backend.tools.failing_tool import FailingTool
+    tool = FailingTool(fail_times=2, fail_message="Simulated network error — retry.")
     return _run_task(
         task=(
             "Use the 'failing_tool' to look up information about AI agents. "
@@ -151,20 +242,14 @@ def _run_failing_tool_test() -> dict:
     )
 
 
-def _run_retry_limit_test() -> dict:
-    """
-    Phase 3 retry-limit test:
-    - FailingTool set to fail 10 times (more than MAX_GOAL_ATTEMPTS)
-    - Agent must hit retry limit → trigger RecoveryManager → choose terminate or fallback
-    - Should NOT loop forever
-    """
+def _run_p3_retry_limit_test() -> dict:
+    """Phase 3: FailingTool permanent failure — must not infinite-loop."""
     from backend.tools.failing_tool import FailingTool
     tool = FailingTool(
         fail_times=10,
         fail_message="Permanent simulated error — this tool cannot succeed.",
         success_output="Impossible success.",
     )
-
     return _run_task(
         task=(
             "Use the 'failing_tool' to retrieve some data. "
@@ -181,7 +266,6 @@ def _run_retry_limit_test() -> dict:
 
 
 def _print_goal_summary(result: dict) -> None:
-    """Print a formatted goal status table after the run."""
     print("\n📋  Goal Summary")
     print("─" * 64)
     _status_emoji = {
@@ -209,7 +293,7 @@ def _print_goal_summary(result: dict) -> None:
     print()
 
 
-def _run_suite(tasks_or_fns: list, suite_name: str) -> tuple[int, int]:
+def _run_suite(tasks_or_fns: list, suite_name: str, use_parallel: bool = False) -> tuple[int, int]:
     """Run a list of test tasks/callables. Returns (passed, failed)."""
     print("\n" + "═" * 64)
     print(f"  ADAPTIVE AGENT RUNTIME — {suite_name}")
@@ -225,18 +309,14 @@ def _run_suite(tasks_or_fns: list, suite_name: str) -> tuple[int, int]:
             if callable(item) and not isinstance(item, str):
                 result = item()
             else:
-                result = _run_task(item)
+                result = _run_task(item, use_parallel=use_parallel)
             _print_goal_summary(result)
-            # P3: accept COMPLETED *or* FAILED with some completed goals as a pass
-            # (retry-limit test intentionally ends with FAILED but proves no infinite loop)
             agent_status = result.get("status", "")
             goals = result.get("goals", [])
             any_completed = any(g["status"] == "COMPLETED" for g in goals)
             if agent_status == "COMPLETED" or any_completed:
                 passed += 1
             else:
-                # For tests that are designed to fail gracefully, still count as passed
-                # if they didn't run forever (budget exhausted would also be ok here)
                 if agent_status in ("FAILED", "BUDGET_EXHAUSTED"):
                     print(f"  ℹ️  Test ended with {agent_status} (graceful termination — counted as PASS)")
                     passed += 1
@@ -267,16 +347,30 @@ def main() -> None:
         rp, rf = _run_suite(_P2_TASKS, "Phase 2 Test Suite (DAG + Dependencies)")
         p += rp; f += rf
         rp, rf = _run_suite(
-            _P3_TASKS + [_run_failing_tool_test, _run_retry_limit_test],
+            _P3_TASKS + [_run_p3_failing_tool_test, _run_p3_retry_limit_test],
             "Phase 3 Test Suite (Reliability + Recovery)"
+        )
+        p += rp; f += rf
+        rp, rf = _run_suite(
+            _P4_TASKS + [_run_p4_budget_test, _run_p4_stuck_test, _run_p4_recovery_test],
+            "Phase 4 Test Suite (Parallel Execution)",
+            use_parallel=True,
         )
         p += rp; f += rf
         print(f"\n🏆  TOTAL: {p} passed, {f} failed across all phases")
         return
 
+    if "--test-p4" in args:
+        _run_suite(
+            _P4_TASKS + [_run_p4_budget_test, _run_p4_stuck_test, _run_p4_recovery_test],
+            "Phase 4 Test Suite (Parallel Execution)",
+            use_parallel=True,
+        )
+        return
+
     if "--test-p3" in args:
         _run_suite(
-            _P3_TASKS + [_run_failing_tool_test, _run_retry_limit_test],
+            _P3_TASKS + [_run_p3_failing_tool_test, _run_p3_retry_limit_test],
             "Phase 3 Test Suite (Reliability + Recovery)"
         )
         return
@@ -289,20 +383,26 @@ def main() -> None:
         _run_suite(_P1_TASKS, "Phase 1 Test Suite")
         return
 
+    # Interactive or single task
     if args:
         task = " ".join(args)
+        use_p = "--parallel" in args
+        task = task.replace("--parallel", "").strip()
     else:
-        print("\nAdaptive Agent Runtime  —  Phase 3")
-        print("Type your task and press Enter. Ctrl+C to exit.\n")
+        print("\nAdaptive Agent Runtime  —  Phase 4")
+        print("Type your task and press Enter. Ctrl+C to exit.")
+        print("Append --parallel to use Phase 4 async parallel execution.\n")
         try:
-            task = input("Task: ").strip()
+            raw = input("Task: ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nExiting.")
             return
-        if not task or task.lower() in ("quit", "exit", "q"):
+        if not raw or raw.lower() in ("quit", "exit", "q"):
             return
+        use_p = "--parallel" in raw
+        task = raw.replace("--parallel", "").strip()
 
-    result = _run_task(task)
+    result = _run_task(task, use_parallel=use_p)
     _print_goal_summary(result)
 
 

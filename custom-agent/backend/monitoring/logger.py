@@ -2,6 +2,8 @@
 Agent trace logger — structured, emoji-annotated terminal output.
 
 Phase 1: Colored terminal trace.
+Phase 4: Added p4_loop/p4_dag/p4_executor/p4_budget/p4_stuck for the
+         structured demo trace that makes the parallel execution visible.
 Phase 5: Each _emit() call will also push a JSON event to a WebSocket queue
          for the React dashboard (hook point marked with TODO: PHASE 5).
 
@@ -120,12 +122,12 @@ class AgentLogger:
 
     def verification(self, goal_id: str, result: "VerificationResult") -> None:
         _status_color = {
-            "VALID":        GREEN,
-            "INCOMPLETE":   YELL,
+            "VALID":         GREEN,
+            "INCOMPLETE":    YELL,
             "CONTRADICTORY": RED,
-            "INVALID":      RED,
-            "UNRELIABLE":   YELL,
-            "SKIPPED":      DIM,
+            "INVALID":       RED,
+            "UNRELIABLE":    YELL,
+            "SKIPPED":       DIM,
         }
         color = _status_color.get(result.status.value, WHITE)
         self._emit(
@@ -177,6 +179,44 @@ class AgentLogger:
 
     def info(self, message: str) -> None:
         self._emit("ℹ️ ", BLUE, message)
+
+    # ── Phase 4 structured labels ─────────────────────────────────────────────
+    # These produce the visible [LOOP]/[DAG]/[EXECUTOR]/[BUDGET]/[STUCK] labels
+    # in the terminal trace — critical for buildathon demo clarity.
+
+    def p4_loop(self, iteration: int, message: str = "") -> None:
+        """Marks the start of each async coordinator iteration."""
+        self._emit(
+            "🔁", CYAN + BOLD,
+            f"[LOOP] Iteration {iteration}" + (f" — {message}" if message else ""),
+        )
+
+    def p4_dag(self, message: str) -> None:
+        """DAG scheduling decision (ready goals, blocked goals, etc.)."""
+        self._emit("🗺 ", BLUE + BOLD, f"[DAG] {message}")
+
+    def p4_executor(self, message: str) -> None:
+        """Async executor concurrency events (launch/concurrent/gather)."""
+        self._emit("⚙️ ", MAG + BOLD, f"[EXECUTOR] {message}")
+
+    def p4_budget(self, used: dict, limits: dict) -> None:
+        """Budget checkpoint — shows usage vs. limits at each iteration."""
+        self._emit(
+            "💰", BLUE,
+            f"[BUDGET] LLM calls: {used.get('llm_calls', '?')}/{limits.get('max_llm_calls', '?')} | "
+            f"Tool calls: {used.get('tool_calls', '?')}/{limits.get('max_tool_calls', '?')} | "
+            f"Iterations: {used.get('iterations', '?')}/{limits.get('max_iterations', '?')}",
+        )
+
+    def p4_stuck(self, is_stuck: bool, reason: str = "", detail: str = "") -> None:
+        """Stuck detection result for each iteration."""
+        if is_stuck:
+            self._emit("🔴", RED + BOLD, f"[STUCK] {reason}: {detail}")
+        else:
+            self._emit(
+                "🟢", GREEN,
+                f"[STUCK] NOT_STUCK" + (f" — {detail}" if detail else ""),
+            )
 
     # ── Event export (Phase 5 hook) ───────────────────────────────────────────
 
