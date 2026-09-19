@@ -1,41 +1,36 @@
-/**
- * StatusPanel — right sidebar showing live agent state.
- *
- * Derives its data from the events array and the final result dict,
- * showing: goals, current tool, verification, recovery count,
- * budget bars, and the final answer.
+﻿/**
+ * StatusPanel - compact stats strip below the AnswerPanel.
+ * Shows: run overview, last action, budget usage, and goal list.
+ * Final answer is NO LONGER here - it lives in AnswerPanel.
  */
 
-/** Parse budget numbers from the "Budget used" event message. */
 function parseBudget(events) {
   const budget = { iterations: 0, toolCalls: 0, llmCalls: 0, elapsed: 0 };
   for (let i = events.length - 1; i >= 0; i--) {
     const m = events[i].message || '';
     if (m.includes('Budget used')) {
-      const iter  = m.match(/iterations:\s*(\d+)/i);
-      const tool  = m.match(/tool calls:\s*(\d+)/i);
-      const llm   = m.match(/LLM calls:\s*(\d+)/i);
-      const elap  = m.match(/elapsed:\s*([\d.]+)/i);
-      if (iter)  budget.iterations = parseInt(iter[1]);
-      if (tool)  budget.toolCalls  = parseInt(tool[1]);
-      if (llm)   budget.llmCalls   = parseInt(llm[1]);
-      if (elap)  budget.elapsed    = parseFloat(elap[1]);
+      const iter = m.match(/iterations:\s*(\d+)/i);
+      const tool = m.match(/tool calls:\s*(\d+)/i);
+      const llm  = m.match(/LLM calls:\s*(\d+)/i);
+      const elap = m.match(/elapsed:\s*([\d.]+)/i);
+      if (iter) budget.iterations = parseInt(iter[1]);
+      if (tool) budget.toolCalls  = parseInt(tool[1]);
+      if (llm)  budget.llmCalls   = parseInt(llm[1]);
+      if (elap) budget.elapsed    = parseFloat(elap[1]);
       break;
     }
-    // Also parse [BUDGET] lines
     if (m.includes('[BUDGET]')) {
-      const iter  = m.match(/Iterations:\s*(\d+)\//i);
-      const tool  = m.match(/Tool calls:\s*(\d+)\//i);
-      const llm   = m.match(/LLM calls:\s*(\d+)\//i);
-      if (iter)  budget.iterations = parseInt(iter[1]);
-      if (tool)  budget.toolCalls  = parseInt(tool[1]);
-      if (llm)   budget.llmCalls   = parseInt(llm[1]);
+      const iter = m.match(/Iterations:\s*(\d+)\//i);
+      const tool = m.match(/Tool calls:\s*(\d+)\//i);
+      const llm  = m.match(/LLM calls:\s*(\d+)\//i);
+      if (iter) budget.iterations = parseInt(iter[1]);
+      if (tool) budget.toolCalls  = parseInt(tool[1]);
+      if (llm)  budget.llmCalls   = parseInt(llm[1]);
     }
   }
   return budget;
 }
 
-/** Count recovery events in the trace. */
 function countRecoveries(events) {
   return events.filter(e =>
     (e.emoji === '🔄' || e.emoji === '🔁') &&
@@ -43,7 +38,6 @@ function countRecoveries(events) {
   ).length;
 }
 
-/** Get the last tool selection info from events. */
 function getLastTool(events) {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
@@ -56,7 +50,6 @@ function getLastTool(events) {
   return null;
 }
 
-/** Get last verification status from events. */
 function getLastVerification(events) {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
@@ -91,27 +84,26 @@ function BudgetBar({ label, value, max, barClass }) {
 }
 
 const GOAL_STATUS_ICON = {
-  COMPLETED:         '✅',
-  FAILED:            '❌',
-  RUNNING:           '🔄',
-  PENDING:           '⏳',
-  BLOCKED:           '🚫',
-  NEEDS_VERIFICATION:'🔍',
-  SKIPPED:           '⏭️',
+  COMPLETED:          '✅',
+  FAILED:             '❌',
+  RUNNING:            '🔄',
+  PENDING:            '⏳',
+  BLOCKED:            '🚫',
+  NEEDS_VERIFICATION: '🔍',
+  SKIPPED:            '⏭️',
 };
 
 export function StatusPanel({ events, result, status }) {
-  const budget      = parseBudget(events);
-  const recoveries  = countRecoveries(events);
-  const lastTool    = getLastTool(events);
-  const lastVerify  = getLastVerification(events);
+  const budget     = parseBudget(events);
+  const recoveries = countRecoveries(events);
+  const lastTool   = getLastTool(events);
+  const lastVerify = getLastVerification(events);
 
   const goals = result?.goals || [];
-  const finalAnswer = result?.answer;
 
   const budgetResult = result?.budget || {};
   const displayBudget = {
-    iterations: budgetResult.iterations ?? budget.iterations,
+    iterations: budgetResult.iterations  ?? budget.iterations,
     toolCalls:  budgetResult.tool_calls  ?? budget.toolCalls,
     llmCalls:   budgetResult.llm_calls   ?? budget.llmCalls,
     elapsed:    budgetResult.elapsed_seconds ?? budget.elapsed,
@@ -119,7 +111,8 @@ export function StatusPanel({ events, result, status }) {
 
   return (
     <div className="status-panel">
-      {/* ── Overview stats ── */}
+
+      {/* ── Overview stats (4 mini cards) ── */}
       <div className="status-section">
         <div className="status-section-title">Run Overview</div>
         <div className="stat-grid">
@@ -146,15 +139,13 @@ export function StatusPanel({ events, result, status }) {
         </div>
       </div>
 
-      {/* ── Current tool ── */}
+      {/* ── Last action ── */}
       <div className="status-section">
         <div className="status-section-title">Last Action</div>
         <div className="info-row">
           <div className="info-field">
             <span className="info-key">Tool</span>
-            <span className="info-val mono">
-              {lastTool?.name || '—'}
-            </span>
+            <span className="info-val mono">{lastTool?.name || '—'}</span>
           </div>
           {lastTool?.input && (
             <div className="info-field">
@@ -183,9 +174,9 @@ export function StatusPanel({ events, result, status }) {
       <div className="status-section">
         <div className="status-section-title">Budget Usage</div>
         <div className="budget-bars">
-          <BudgetBar label="LLM Calls"   value={displayBudget.llmCalls}   max={40}  barClass="bar-purple" />
-          <BudgetBar label="Tool Calls"  value={displayBudget.toolCalls}  max={25}  barClass="bar-blue"   />
-          <BudgetBar label="Iterations"  value={displayBudget.iterations} max={15}  barClass="bar-green"  />
+          <BudgetBar label="LLM Calls"  value={displayBudget.llmCalls}   max={40} barClass="bar-purple" />
+          <BudgetBar label="Tool Calls" value={displayBudget.toolCalls}  max={25} barClass="bar-blue"   />
+          <BudgetBar label="Iterations" value={displayBudget.iterations} max={15} barClass="bar-green"  />
         </div>
       </div>
 
@@ -202,9 +193,7 @@ export function StatusPanel({ events, result, status }) {
                 <div className="goal-body">
                   <div className="goal-desc">{g.description}</div>
                   <div className="goal-meta">
-                    <span className={`goal-status-badge badge-${g.status}`}>
-                      {g.status}
-                    </span>
+                    <span className={`goal-status-badge badge-${g.status}`}>{g.status}</span>
                     {g.attempts > 0 && (
                       <span>{g.attempts} attempt{g.attempts !== 1 ? 's' : ''}</span>
                     )}
@@ -221,17 +210,6 @@ export function StatusPanel({ events, result, status }) {
         </div>
       )}
 
-      {/* ── Final answer ── */}
-      <div className="status-section">
-        <div className="status-section-title">Final Answer</div>
-        {finalAnswer ? (
-          <div className="final-answer-box">{finalAnswer}</div>
-        ) : status === 'running' ? (
-          <div className="final-answer-empty">Waiting for agent to finish…</div>
-        ) : (
-          <div className="final-answer-empty">No answer yet.</div>
-        )}
-      </div>
     </div>
   );
 }

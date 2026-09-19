@@ -1,24 +1,27 @@
-/**
- * App — main shell for the Adaptive Agent Runtime dashboard.
+﻿/**
+ * App - main shell for the Adaptive Agent Runtime dashboard.
  *
- * Layout:
- *   ┌──────── header ────────────────────────────────┐
- *   │  [left panel]       │  [status panel]          │
- *   │  input section      │  overview stats          │
- *   │  ─────────────      │  last action             │
- *   │  trace panel        │  budget bars             │
- *   │  (live events)      │  goals                   │
- *   │                     │  final answer            │
- *   └─────────────────────┴──────────────────────────┘
+ * Layout (desktop):
+ *   +--header---------------------------------------------------+
+ *   | LEFT PANEL                | RIGHT PANEL                   |
+ *   |  [Task input]             | [Answer Panel]                |
+ *   |  ─────────────            |   Final Answer (scrollable)   |
+ *   |  [Trace Panel]            |   ─────────────────────────   |
+ *   |   live events             | [Stats Panel]                 |
+ *   |   (scrollable)            |   goals, budget, last tool    |
+ *   +-----------------------------------------------------------+
+ *
+ * The trace and answer panels scroll INDEPENDENTLY.
  */
 import { useState, useCallback } from 'react';
 import { useAgentRun } from './hooks/useAgentRun';
 import { TracePanel } from './components/TracePanel';
+import { AnswerPanel } from './components/AnswerPanel';
 import { StatusPanel } from './components/StatusPanel';
 
 const EXAMPLE_TASKS = [
   'What is 25 * 47 + 100?',
-  'Search for information about AI agent frameworks',
+  'Calculate 15% of 80,000',
   'Calculate compound interest on $10,000 at 5% for 3 years, then search for current savings rates',
   'Calculate 99 * 99 and search for the speed of light in km/s simultaneously',
 ];
@@ -40,7 +43,7 @@ function StatusDot({ status }) {
 }
 
 export default function App() {
-  const [task, setTask]           = useState('');
+  const [task, setTask]            = useState('');
   const [useParallel, setParallel] = useState(false);
   const { status, events, result, errorMsg, startRun, clearRun } = useAgentRun();
 
@@ -70,16 +73,17 @@ export default function App() {
         <div>
           <div className="app-header-title">
             Adaptive Agent Runtime
-            <span className="app-header-subtitle"> · Phase 5 Dashboard</span>
+            <span className="app-header-subtitle"> · Custom AI Brain</span>
           </div>
         </div>
         <div className="app-header-spacer" />
         <StatusDot status={status} />
       </div>
 
-      {/* ── Body ── */}
+      {/* ── Body: two main columns ── */}
       <div className="app-body">
-        {/* ── Left: input + trace ── */}
+
+        {/* ── LEFT: Task input + Execution Trace ── */}
         <div className="left-panel">
           {/* Input section */}
           <div className="input-section">
@@ -91,7 +95,7 @@ export default function App() {
                 value={task}
                 onChange={e => setTask(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder="Enter a task for the agent… (Ctrl+Enter to run)"
+                placeholder="Enter a task… (Ctrl+Enter to run)"
                 disabled={isRunning}
                 rows={3}
               />
@@ -127,7 +131,7 @@ export default function App() {
                   onChange={e => setParallel(e.target.checked)}
                   disabled={isRunning}
                 />
-                Parallel execution (Phase 4)
+                Parallel (Phase 4)
               </label>
 
               <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>
@@ -155,7 +159,7 @@ export default function App() {
                   }}
                   title={ex}
                 >
-                  {ex.slice(0, 30)}…
+                  {ex.slice(0, 28)}…
                 </button>
               ))}
             </div>
@@ -168,12 +172,22 @@ export default function App() {
             </div>
           )}
 
+          {/* Left panel label */}
+          <div className="panel-section-label">🔄 Execution Trace</div>
+
           {/* Live trace */}
           <TracePanel events={events} status={status} />
         </div>
 
-        {/* ── Right: status panel ── */}
-        <StatusPanel events={events} result={result} status={status} />
+        {/* ── RIGHT: Answer + compact stats ── */}
+        <div className="right-panel">
+          {/* Final Answer — main content, independently scrollable */}
+          <AnswerPanel result={result} status={status} />
+
+          {/* Compact stats strip */}
+          <StatusPanel events={events} result={result} status={status} />
+        </div>
+
       </div>
     </div>
   );
